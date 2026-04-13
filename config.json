@@ -1,0 +1,33 @@
+{
+    "eps": 0.1,
+    "min_samples": 15,
+    "nb_neighbors": 10,
+    "std_ratio": 0.05,
+    "grid_size": 1.0,
+    "ground_tolerance": 0.2,
+    "trunk_height_min": 0.3,
+    "trunk_height_max": 0.8,
+    "min_height_ratio": 0.5,
+    "background_color": [0.7, 0.7, 0.7],
+    "point_size": 1.0,
+    "camera_settings": {
+        "front": [1.0, 1.0, 0.8],
+        "lookat": [30.0, 0.0, 0.0],
+        "up": [0, 0.0, 1.0],
+        "zoom": 0.01
+    },
+      "window_size": {
+        "width": 640,
+        "height": 480
+    },
+      "csf_params": {
+        "bSloopSmooth": true,
+        "cloth_resolution": 0.5,
+        "rigidness": 1,
+        "time_step": 0.65,
+        "class_threshold": 0.1
+    },
+      "cell_size": 1.0,
+      "min_relative_height": 0,
+      "max_relative_height": 0.7
+}
