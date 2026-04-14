@@ -220,7 +220,7 @@ def plot_pole_map_2d(poles):
 with open('config.json', 'r') as f:
     config = json.load(f)
 
-OVERLAY_ORIGINAL   = False  # True = grey background + clusters | False = clusters only
+OVERLAY_ORIGINAL   = True  # True = grey background + clusters | False = clusters only
 SAVE_POLE_PCD      = True   # save clustered poles as PLY for Graphbuilding.py
 POLE_PCD_PATH      = "./poles_clustered.ply"
 POLE_CSV_PATH      = "./pole_map.csv"

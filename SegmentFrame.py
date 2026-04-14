@@ -36,10 +36,20 @@ OVERLAY_ORIGINAL   = True  # True = grey raw point cloud background + coloured c
 
 # Range-adaptive clustering
 # Points beyond FAR_RANGE_M use relaxed DBSCAN params so sparse distant poles
-# are still detected.  Set FAR_RANGE_M to a large value to disable.
-FAR_RANGE_M        = 15.0   # metres XY – threshold between near and far zones
-FAR_EPS_SCALE      = 2.5    # multiply config["eps"] for far-zone pass 1
-FAR_MIN_SAMPLES    = 2      # min_samples for far-zone (very sparse returns)
+# are still detected. Three distance tiers for increasingly sparse density.
+NEAR_RANGE_M       = 8.0     # metres XY – near zone (dense returns)
+FAR_RANGE_M        = 15.0    # metres XY – far zone (sparse returns)
+ULTRA_FAR_RANGE_M  = 50.0    # metres XY – ultra-far zone (very sparse)
+
+# DBSCAN scaling by zone
+NEAR_EPS_SCALE     = 1.0     # × config["eps"]
+NEAR_MIN_SAMPLES   = 3
+
+FAR_EPS_SCALE      = 3.0     # × config["eps"]  (wider tolerance for sparse)
+FAR_MIN_SAMPLES    = 2
+
+ULTRA_FAR_EPS_SCALE = 5.0    # × config["eps"]  (very wide tolerance)
+ULTRA_FAR_MIN_SAMPLES = 1    # single connected points count as clusters
 
 # Vehicle / self-hit filter
 # Points whose XY distance from the sensor origin is below this threshold are
@@ -226,8 +236,25 @@ def visualise_poles_3d(poles, pole_pts, pole_labels, raw_points=None):
     vis.destroy_window()
 
 
-def plot_pole_map_2d(poles):
+def plot_pole_map_2d(poles, raw_points=None):
     fig, ax = plt.subplots(figsize=(14, 12))
+
+    # Overlay raw point cloud if OVERLAY_ORIGINAL is True
+    if raw_points is not None and OVERLAY_ORIGINAL and len(raw_points) > 0:
+        try:
+            # Subsample to avoid overwhelming matplotlib (>50k points causes slowdown)
+            if len(raw_points) > 50000:
+                subsample_idx = np.random.choice(len(raw_points), 50000, replace=False)
+                raw_to_plot = raw_points[subsample_idx]
+            else:
+                raw_to_plot = raw_points
+
+            bg_color = config.get("background_color", [0.7, 0.7, 0.7])
+            if isinstance(bg_color, list) and len(bg_color) == 3:
+                ax.scatter(raw_to_plot[:, 0], raw_to_plot[:, 1], s=0.1,
+                          color=bg_color, alpha=0.2, rasterized=True, zorder=1)
+        except Exception as e:
+            print(f"  Warning: raw point overlay failed ({e}), skipping")
 
     for p in poles:
         cx, cy  = p.centroid[0], p.centroid[1]
@@ -298,29 +325,47 @@ def segment_frame(pcd_path: str):
         return [], trunk_pts, np.array([]), points
 
     # ── Range-adaptive pass 1: DBSCAN → height-extent filter ────────────────────
-    # Near zone: standard relaxed params; far zone: wider eps + lower min_samples
-    eps_near  = config["eps"] * 1.5
-    samp_near = max(3, config["min_samples"] // 3)
+    # Three density zones based on distance from sensor
+    eps_near  = config["eps"] * NEAR_EPS_SCALE
+    samp_near = NEAR_MIN_SAMPLES
     eps_far   = config["eps"] * FAR_EPS_SCALE
     samp_far  = FAR_MIN_SAMPLES
+    eps_ultra = config["eps"] * ULTRA_FAR_EPS_SCALE
+    samp_ultra = ULTRA_FAR_MIN_SAMPLES
 
     xy_dist_trunk = np.linalg.norm(trunk_pts[:, :2], axis=1)
-    near_mask     = xy_dist_trunk <= FAR_RANGE_M
-    far_mask      = ~near_mask
-    print(f"  Trunk near/far split: {near_mask.sum()} near  /  {far_mask.sum()} far  (threshold {FAR_RANGE_M}m)")
+    near_mask  = xy_dist_trunk <= NEAR_RANGE_M
+    far_mask   = (xy_dist_trunk > NEAR_RANGE_M) & (xy_dist_trunk <= FAR_RANGE_M)
+    ultra_mask = xy_dist_trunk > FAR_RANGE_M
+    print(f"  Trunk split: {near_mask.sum()} near / {far_mask.sum()} far / {ultra_mask.sum()} ultra")
 
     def _cluster_and_filter(pts):
         if len(pts) < 3:
             return np.zeros(0, dtype=bool)
-        is_far = np.linalg.norm(pts[:, :2], axis=1) > FAR_RANGE_M
+
+        xy_dist = np.linalg.norm(pts[:, :2], axis=1)
+        is_near  = xy_dist <= NEAR_RANGE_M
+        is_far   = (xy_dist > NEAR_RANGE_M) & (xy_dist <= FAR_RANGE_M)
+        is_ultra = xy_dist > FAR_RANGE_M
+
         labels = np.full(len(pts), -1, dtype=int)
-        if (~is_far).any():
-            labels[~is_far] = run_dbscan(pts[~is_far], eps=eps_near, min_samples=samp_near)
+
+        # Near zone
+        if is_near.any():
+            labels[is_near] = run_dbscan(pts[is_near], eps=eps_near, min_samples=samp_near)
+
+        # Far zone
         if is_far.any():
             far_labels = run_dbscan(pts[is_far], eps=eps_far, min_samples=samp_far)
-            # offset far cluster IDs to avoid collision with near IDs
             offset = int(labels.max()) + 1 if labels.max() >= 0 else 0
             labels[is_far] = np.where(far_labels == -1, -1, far_labels + offset)
+
+        # Ultra-far zone
+        if is_ultra.any():
+            ultra_labels = run_dbscan(pts[is_ultra], eps=eps_ultra, min_samples=samp_ultra)
+            offset = int(labels.max()) + 1 if labels.max() >= 0 else 0
+            labels[is_ultra] = np.where(ultra_labels == -1, -1, ultra_labels + offset)
+
         return filter_by_height_extent(pts, labels,
                                        config["trunk_height_min"],
                                        config["trunk_height_max"],
@@ -334,16 +379,26 @@ def segment_frame(pcd_path: str):
         print("  WARNING: no points survived height-extent filter.")
         return [], clean_pts, np.array([]), points
 
-    # ── Pass 2: final DBSCAN on cleaned trunk points (same range split) ───────
+    # ── Pass 2: final DBSCAN on cleaned trunk points (same three-zone split) ────
     xy_dist_clean = np.linalg.norm(clean_pts[:, :2], axis=1)
-    is_far2       = xy_dist_clean > FAR_RANGE_M
-    labels2       = np.full(len(clean_pts), -1, dtype=int)
-    if (~is_far2).any():
-        labels2[~is_far2] = run_dbscan(clean_pts[~is_far2], eps=eps_near, min_samples=samp_near)
+    is_near2  = xy_dist_clean <= NEAR_RANGE_M
+    is_far2   = (xy_dist_clean > NEAR_RANGE_M) & (xy_dist_clean <= FAR_RANGE_M)
+    is_ultra2 = xy_dist_clean > FAR_RANGE_M
+
+    labels2 = np.full(len(clean_pts), -1, dtype=int)
+
+    if is_near2.any():
+        labels2[is_near2] = run_dbscan(clean_pts[is_near2], eps=eps_near, min_samples=samp_near)
+
     if is_far2.any():
         far_labels2 = run_dbscan(clean_pts[is_far2], eps=eps_far, min_samples=samp_far)
-        offset2     = int(labels2.max()) + 1 if labels2.max() >= 0 else 0
+        offset2 = int(labels2.max()) + 1 if labels2.max() >= 0 else 0
         labels2[is_far2] = np.where(far_labels2 == -1, -1, far_labels2 + offset2)
+
+    if is_ultra2.any():
+        ultra_labels2 = run_dbscan(clean_pts[is_ultra2], eps=eps_ultra, min_samples=samp_ultra)
+        offset2 = int(labels2.max()) + 1 if labels2.max() >= 0 else 0
+        labels2[is_ultra2] = np.where(ultra_labels2 == -1, -1, ultra_labels2 + offset2)
 
     n_clusters = len(set(labels2) - {-1})
     print(f"  Raw clusters        : {n_clusters}")
@@ -388,7 +443,7 @@ if __name__ == "__main__":
               f"{p.centroid[2]:>8.3f}  {p.radius:>8.4f}  "
               f"{p.tilt_deg:>7.1f}  {p.n_points:>5}")
 
-    plot_pole_map_2d(poles)
+    plot_pole_map_2d(poles, raw_points=all_points)
 
     if len(vis_pts) > 0:
         raw_bg = all_points if OVERLAY_ORIGINAL else None
